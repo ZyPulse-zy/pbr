@@ -1,0 +1,59 @@
+name: Validate Tor counters against real isolated traffic
+on:
+  push:
+    branches: [bootstrap/tor-counter-import]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify exact signed-off source commit
+        run: |
+          base64 -d .bootstrap/tor-counter.bundle.b64 > /tmp/tor.bundle
+          echo '5d675287b189bcdebd099c956cb1ed982f62d9d4744adf4df035e85b213cddb4  /tmp/tor.bundle' | sha256sum -c -
+          git fetch /tmp/tor.bundle HEAD:refs/remotes/import/candidate
+          test "$(git rev-parse refs/remotes/import/candidate)" = 5ebe0eef3e5229073cfe4508695743f571d6a177
+          git checkout --detach refs/remotes/import/candidate
+      - name: Install test dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y build-essential cmake libjson-c-dev libmd-dev gawk nftables iproute2
+      - name: Build oldest supported ucode from exact official source
+        run: |
+          git init -q "$RUNNER_TEMP/ucode-src"
+          git -C "$RUNNER_TEMP/ucode-src" fetch -q --depth 1 https://github.com/jow-/ucode.git 85922056ef7abeace3cca3ab28bc1ac2d88e31b1
+          git -C "$RUNNER_TEMP/ucode-src" checkout -q FETCH_HEAD
+          cmake -S "$RUNNER_TEMP/ucode-src" -B "$RUNNER_TEMP/ucode-build" -DCMAKE_BUILD_TYPE=Release -DRTNL_SUPPORT=OFF -DNL80211_SUPPORT=OFF -DUBUS_SUPPORT=OFF -DUCI_SUPPORT=OFF
+          cmake --build "$RUNNER_TEMP/ucode-build" --target ucode fs_lib -j2
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\nexec "%s/ucode" -L "%s/*.so" "$@"\n' "$RUNNER_TEMP/ucode-build" "$RUNNER_TEMP/ucode-build" > "$RUNNER_TEMP/bin/ucode"
+          chmod +x "$RUNNER_TEMP/bin/ucode"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Syntax gate with oldest supported interpreter
+        run: tests/check-ucode-syntax.sh "$RUNNER_TEMP/ucode-build/ucode"
+      - name: Prepare original implementation with same tests
+        run: |
+          git worktree add --detach /tmp/pbr-original ae1b32d33fdb05e5c87d2510d56b7dd19470ed34
+          cp tests/04_policies/10_tor_counter_position /tmp/pbr-original/tests/04_policies/
+          cp -r tests/kernel /tmp/pbr-original/tests/kernel
+          if (cd /tmp/pbr-original && bash tests/run_tests.sh tests/04_policies/10_tor_counter_position) > /tmp/unit-before.log 2>&1; then
+            echo 'Expected original emitter failure'; exit 1
+          fi
+          grep -q '14/24 passed' /tmp/unit-before.log
+      - name: Load isolated test modules
+        run: sudo modprobe nft_chain_nat && sudo modprobe nft_redir
+      - name: Confirm actual original counter failure
+        run: |
+          if sudo env PBR_TEST_PARENT_NETNS="$(readlink /proc/self/ns/net)" unshare -n python3 /tmp/pbr-original/tests/kernel/test-tor-counters.py --ucode "$RUNNER_TEMP/bin/ucode" > /tmp/kernel-before.log 2>&1; then
+            echo 'Expected original kernel counter failure'; exit 1
+          fi
+          cat /tmp/kernel-before.log
+          grep -q 'Tor counters included nonmatching' /tmp/kernel-before.log
+      - name: Complete actual ucode suite
+        run: bash tests/run_tests.sh
+      - name: Validate all ten counters against isolated IPv4 and IPv6 traffic
+        run: sudo env PBR_TEST_PARENT_NETNS="$(readlink /proc/self/ns/net)" unshare -n python3 tests/kernel/test-tor-counters.py --ucode "$RUNNER_TEMP/bin/ucode"
+      - name: Publish exact validated branch
+        run: git push --force-with-lease=refs/heads/fix/tor-counter-position:ae1b32d33fdb05e5c87d2510d56b7dd19470ed34 origin HEAD:refs/heads/fix/tor-counter-position
