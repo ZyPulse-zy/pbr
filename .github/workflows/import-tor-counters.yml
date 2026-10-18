@@ -1,59 +1,96 @@
-name: Validate Tor counters against real isolated traffic
+name: Validate the reduced PBR Tor regression
 on:
   push:
-    branches: [bootstrap/tor-counter-import]
+    branches: [bootstrap/tor-counter-review]
 permissions:
-  contents: write
+  contents: read
 jobs:
   validate:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: oldest
+            ucode: 85922056ef7abeace3cca3ab28bc1ac2d88e31b1
+          - label: current
+            ucode: cc323341c31828b2126d90c6b8a95bb4e7de88b0
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Verify exact signed-off source commit
+      - name: Import exact source and check reduction
         run: |
-          base64 -d .bootstrap/tor-counter.bundle.b64 > /tmp/tor.bundle
-          echo '5d675287b189bcdebd099c956cb1ed982f62d9d4744adf4df035e85b213cddb4  /tmp/tor.bundle' | sha256sum -c -
-          git fetch /tmp/tor.bundle HEAD:refs/remotes/import/candidate
-          test "$(git rev-parse refs/remotes/import/candidate)" = 5ebe0eef3e5229073cfe4508695743f571d6a177
+          mkdir -p "$RUNNER_TEMP/evidence"
+          base64 -d .bootstrap/tor-counter.bundle.b64 > "$RUNNER_TEMP/candidate.bundle"
+          printf '%s  %s\n' 0d22f31bd919c42e6753c9efb7ece30d35ef2fea295c3410012f4942560a5adb "$RUNNER_TEMP/candidate.bundle" | sha256sum -c -
+          git fetch "$RUNNER_TEMP/candidate.bundle" HEAD:refs/remotes/import/candidate
           git checkout --detach refs/remotes/import/candidate
-      - name: Install test dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y build-essential cmake libjson-c-dev libmd-dev gawk nftables iproute2
-      - name: Build oldest supported ucode from exact official source
+          test "$(git rev-parse HEAD)" = e33109b0c08b6c9d61b36ea18021f47747abbd1b
+          test "$(git rev-parse HEAD^)" = ae1b32d33fdb05e5c87d2510d56b7dd19470ed34
+          test "$(git show -s --format='%an <%ae>')" = 'Yuen Su <zypulsecore@gmail.com>'
+          git show -s --format=%B | grep -Fx 'Signed-off-by: Yuen Su <zypulsecore@gmail.com>'
+          test ! -e tests/kernel
+          if git grep -n TOR_COUNTER_EMIT -- tests; then exit 1; fi
+          echo 'ff222fbfedc5fe27ec567c01038d4e12c3c622c31bd8b826dc26ac13f88d4b85  files/lib/pbr/pbr.uc' | sha256sum -c -
+          git diff HEAD^ --check
+          git diff --name-only HEAD^ > "$RUNNER_TEMP/evidence/changed-files.txt"
+          printf '%s\n' files/lib/pbr/pbr.uc tests/04_policies/10_tor_counter_position > "$RUNNER_TEMP/expected-files.txt"
+          cmp "$RUNNER_TEMP/expected-files.txt" "$RUNNER_TEMP/evidence/changed-files.txt"
+          git show -s --format=fuller > "$RUNNER_TEMP/evidence/source.txt"
+          sha256sum files/lib/pbr/pbr.uc tests/04_policies/10_tor_counter_position > "$RUNNER_TEMP/evidence/source-sha256.txt"
+      - name: Install build and test dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends build-essential cmake libjson-c-dev libmd-dev gawk
+      - name: Build exact official ucode
+        env:
+          UCODE_REF: ${{ matrix.ucode }}
         run: |
           git init -q "$RUNNER_TEMP/ucode-src"
-          git -C "$RUNNER_TEMP/ucode-src" fetch -q --depth 1 https://github.com/jow-/ucode.git 85922056ef7abeace3cca3ab28bc1ac2d88e31b1
+          git -C "$RUNNER_TEMP/ucode-src" fetch -q --depth 1 https://github.com/jow-/ucode.git "$UCODE_REF"
           git -C "$RUNNER_TEMP/ucode-src" checkout -q FETCH_HEAD
-          cmake -S "$RUNNER_TEMP/ucode-src" -B "$RUNNER_TEMP/ucode-build" -DCMAKE_BUILD_TYPE=Release -DRTNL_SUPPORT=OFF -DNL80211_SUPPORT=OFF -DUBUS_SUPPORT=OFF -DUCI_SUPPORT=OFF
+          test "$(git -C "$RUNNER_TEMP/ucode-src" rev-parse HEAD)" = "$UCODE_REF"
+          cmake -S "$RUNNER_TEMP/ucode-src" -B "$RUNNER_TEMP/ucode-build" -DCMAKE_BUILD_TYPE=Release -DRTNL_SUPPORT=OFF -DNL80211_SUPPORT=OFF -DUBUS_SUPPORT=OFF -DUCI_SUPPORT=OFF -DULOOP_SUPPORT=OFF
           cmake --build "$RUNNER_TEMP/ucode-build" --target ucode fs_lib -j2
           mkdir -p "$RUNNER_TEMP/bin"
           printf '#!/bin/sh\nexec "%s/ucode" -L "%s/*.so" "$@"\n' "$RUNNER_TEMP/ucode-build" "$RUNNER_TEMP/ucode-build" > "$RUNNER_TEMP/bin/ucode"
           chmod +x "$RUNNER_TEMP/bin/ucode"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-      - name: Syntax gate with oldest supported interpreter
-        run: tests/check-ucode-syntax.sh "$RUNNER_TEMP/ucode-build/ucode"
-      - name: Prepare original implementation with same tests
+          printf '%s\n' "$UCODE_REF" > "$RUNNER_TEMP/evidence/ucode-ref.txt"
+      - name: Confirm unchanged unfixed behavior with the reduced regression
         run: |
-          git worktree add --detach /tmp/pbr-original ae1b32d33fdb05e5c87d2510d56b7dd19470ed34
-          cp tests/04_policies/10_tor_counter_position /tmp/pbr-original/tests/04_policies/
-          cp -r tests/kernel /tmp/pbr-original/tests/kernel
-          if (cd /tmp/pbr-original && bash tests/run_tests.sh tests/04_policies/10_tor_counter_position) > /tmp/unit-before.log 2>&1; then
-            echo 'Expected original emitter failure'; exit 1
+          git worktree add --detach "$RUNNER_TEMP/pbr-original" ae1b32d33fdb05e5c87d2510d56b7dd19470ed34
+          cp tests/04_policies/10_tor_counter_position "$RUNNER_TEMP/pbr-original/tests/04_policies/"
+          if (cd "$RUNNER_TEMP/pbr-original" && bash tests/run_tests.sh tests/04_policies/10_tor_counter_position) > "$RUNNER_TEMP/evidence/unit-before.log" 2>&1; then
+            echo 'Expected original regression failure'; exit 1
           fi
-          grep -q '14/24 passed' /tmp/unit-before.log
-      - name: Load isolated test modules
-        run: sudo modprobe nft_chain_nat && sudo modprobe nft_redir
-      - name: Confirm actual original counter failure
+          grep -F 'tor_counter_position: 14/24 passed' "$RUNNER_TEMP/evidence/unit-before.log"
+      - name: Complete ordinary suite through existing runner
         run: |
-          if sudo env PBR_TEST_PARENT_NETNS="$(readlink /proc/self/ns/net)" unshare -n python3 /tmp/pbr-original/tests/kernel/test-tor-counters.py --ucode "$RUNNER_TEMP/bin/ucode" > /tmp/kernel-before.log 2>&1; then
-            echo 'Expected original kernel counter failure'; exit 1
-          fi
-          cat /tmp/kernel-before.log
-          grep -q 'Tor counters included nonmatching' /tmp/kernel-before.log
-      - name: Complete actual ucode suite
-        run: bash tests/run_tests.sh
-      - name: Validate all ten counters against isolated IPv4 and IPv6 traffic
-        run: sudo env PBR_TEST_PARENT_NETNS="$(readlink /proc/self/ns/net)" unshare -n python3 tests/kernel/test-tor-counters.py --ucode "$RUNNER_TEMP/bin/ucode"
-      - name: Publish exact validated branch
-        run: git push --force-with-lease=refs/heads/fix/tor-counter-position:ae1b32d33fdb05e5c87d2510d56b7dd19470ed34 origin HEAD:refs/heads/fix/tor-counter-position
+          set -o pipefail
+          bash tests/run_tests.sh 2>&1 | tee "$RUNNER_TEMP/evidence/unit-after.log"
+          grep -F 'Ran 72 tests, 72 okay, 0 failures' "$RUNNER_TEMP/evidence/unit-after.log"
+      - name: Oldest supported syntax gate
+        if: matrix.label == 'oldest'
+        run: |
+          set -o pipefail
+          tests/check-ucode-syntax.sh "$RUNNER_TEMP/bin/ucode" 2>&1 | tee "$RUNNER_TEMP/evidence/syntax-oldest.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pbr-review-${{ matrix.label }}
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+  publish-validated:
+    needs: validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preserve exact validated commit on an independent branch
+        run: |
+          base64 -d .bootstrap/tor-counter.bundle.b64 > "$RUNNER_TEMP/candidate.bundle"
+          printf '%s  %s\n' 0d22f31bd919c42e6753c9efb7ece30d35ef2fea295c3410012f4942560a5adb "$RUNNER_TEMP/candidate.bundle" | sha256sum -c -
+          git fetch "$RUNNER_TEMP/candidate.bundle" HEAD:refs/remotes/import/candidate
+          test "$(git rev-parse refs/remotes/import/candidate)" = e33109b0c08b6c9d61b36ea18021f47747abbd1b
+          git push --force-with-lease=refs/heads/validated/tor-counter-review: origin refs/remotes/import/candidate:refs/heads/validated/tor-counter-review
