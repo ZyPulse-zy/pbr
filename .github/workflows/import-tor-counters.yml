@@ -87,6 +87,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Preserve exact validated commit on an independent branch
         run: |
           base64 -d .bootstrap/tor-counter.bundle.b64 > "$RUNNER_TEMP/candidate.bundle"
